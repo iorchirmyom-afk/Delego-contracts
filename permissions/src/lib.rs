@@ -21,6 +21,10 @@ pub const CONTRACT_SEMVER: &str = "0_1_0";
 /// costs unexpectedly.
 pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
 
+/// Maximum number of entries retained in a single (owner, delegate) pair's
+/// audit log. Once exceeded, the oldest entry is dropped on each append so
+/// long-lived permissions don't accrue unbounded storage.
+pub const MAX_AUDIT_ENTRIES: u32 = 200;
 /// Upper bound on the velocity limit's minimum-spend-interval, in ledgers.
 /// At ~5s per ledger this is roughly one year; anything above this would
 /// effectively disable spending forever with no clear signal, so it is
@@ -78,6 +82,9 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// A multi-owner spend accumulation would overflow or exceed the
+    /// permission's total allowance
+    ExceedsAllowance = 410,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 500,
 }
@@ -338,6 +345,15 @@ pub struct PermissionExpiryUpdatedEvent {
     pub new_expiry: u32,
 }
 
+/// Emitted by `set_relayer_key` whenever a delegate's relayer signing key
+/// is registered or rotated, so a key swap (e.g. from a compromised
+/// delegate) leaves an on-chain trace.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RelayerKeyChangedEvent {
+    pub delegate: Address,
+    pub old_key: Option<BytesN<32>>,
+    pub new_key: BytesN<32>,
 /// Emitted by `renew_permission` when a renewal's requested extension would
 /// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
 /// explicit signal rather than a silently saturated expiry.
@@ -1319,9 +1335,36 @@ impl PermissionsContract {
         public_key: BytesN<32>,
     ) -> Result<(), PermissionError> {
         delegate.require_auth();
+
+        let old_key: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RelayerKey(delegate.clone()));
+
         env.storage()
             .instance()
-            .set(&DataKey::RelayerKey(delegate), &public_key);
+            .set(&DataKey::RelayerKey(delegate.clone()), &public_key);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("relaykey")),
+            RelayerKeyChangedEvent {
+                delegate: delegate.clone(),
+                old_key,
+                new_key: public_key,
+            },
+        );
+
+        // Relayer keys aren't scoped to an (owner, delegate) pair, so the
+        // audit trail is keyed by (delegate, delegate) rather than a real
+        // owner relationship.
+        Self::append_audit_log(
+            &env,
+            &delegate,
+            &delegate.clone(),
+            delegate,
+            symbol_short!("relaykey"),
+        );
+
         Ok(())
     }
 
@@ -1591,7 +1634,18 @@ impl PermissionsContract {
         merchant: Address,
     ) -> Result<(), PermissionError> {
         delegate.require_auth();
+
+        // Deduplicate signers before requiring auth or counting them toward
+        // quorum: a duplicate-padded list must not waste auth frames, and
+        // must not be able to satisfy the threshold with fewer real
+        // signers than intended.
+        let mut unique_signers: Vec<Address> = Vec::new(&env);
         for signer in signers.iter() {
+            if !unique_signers.contains(&signer) {
+                unique_signers.push_back(signer);
+            }
+        }
+        for signer in unique_signers.iter() {
             signer.require_auth();
         }
 
@@ -1599,7 +1653,7 @@ impl PermissionsContract {
             env.clone(),
             primary_owner.clone(),
             delegate.clone(),
-            signers.clone(),
+            unique_signers.clone(),
             amount,
             merchant.clone(),
         )?;
@@ -1607,7 +1661,11 @@ impl PermissionsContract {
         let key = DataKey::MultiPermission(primary_owner.clone(), delegate.clone());
         let mut record: MultiOwnerPermission = env.storage().persistent().get(&key).unwrap();
 
-        record.spent += amount;
+        record.spent = record
+            .spent
+            .checked_add(amount)
+            .filter(|spent| *spent <= record.limit_total)
+            .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
 
         let remaining = record.limit_total - record.spent;
@@ -1620,7 +1678,7 @@ impl PermissionsContract {
                 merchant,
                 amount,
                 remaining,
-                signer_count: signers.len(),
+                signer_count: unique_signers.len(),
             },
         );
 
@@ -2668,8 +2726,18 @@ impl PermissionsContract {
             actor,
             timestamp: env.ledger().timestamp(),
         });
+        Self::retain_audit(&mut log, MAX_AUDIT_ENTRIES);
 
         env.storage().persistent().set(&key, &log);
+    }
+
+    /// Drops the oldest entries from `log` until its length is at most
+    /// `cap`, keeping per-permission audit storage flat regardless of how
+    /// many state-changing actions the pair accumulates over its lifetime.
+    fn retain_audit(log: &mut Vec<AuditLogEntry>, cap: u32) {
+        while log.len() > cap {
+            log.remove(0);
+        }
     }
 
     /// spend. Called from both `execute_spend` and `execute_spend_via_relayer`
